@@ -1,0 +1,39 @@
+# =====================================================
+# API GATEWAY REQUIREMENTS
+# services/api-gateway/requirements.txt
+# =====================================================
+
+# FastAPI and ASGI server
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+
+# Database
+sqlalchemy==2.0.23
+psycopg2-binary==2.9.9
+asyncpg==0.29.0
+
+# Kafka
+kafka-python==2.0.2
+confluent-kafka==2.3.0
+
+# File handling
+python-multipart==0.0.6
+aiofiles==23.2.1
+python-magic==0.4.27
+
+# HTTP client
+httpx==0.25.2
+requests==2.31.0
+
+# Validation and serialization
+pydantic==2.5.0
+pydantic-settings==2.1.0
+
+# Utilities
+python-dotenv==1.0.0
+structlog==23.2.0
+rich==13.7.0
+
+# Development and testing
+pytest==7.4.3
+pytest-asyncio==0.21.1

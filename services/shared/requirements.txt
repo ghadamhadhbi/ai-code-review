@@ -1,0 +1,27 @@
+
+# =====================================================
+# SHARED UTILITIES REQUIREMENTS
+# services/shared/requirements.txt
+# =====================================================
+
+# Database
+sqlalchemy==2.0.23
+psycopg2-binary==2.9.9
+asyncpg==0.29.0
+
+# Kafka
+kafka-python==2.0.2
+confluent-kafka==2.3.0
+
+# Data validation
+pydantic==2.5.0
+pydantic-settings==2.1.0
+
+# Utilities
+python-dotenv==1.0.0
+structlog==23.2.0
+rich==13.7.0
+
+# Development and testing
+pytest==7.4.3
+pytest-asyncio==0.21.1

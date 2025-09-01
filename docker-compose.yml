@@ -1,3 +1,4 @@
+version: '3.8'
 
 services:
   # Kafka Infrastructure
@@ -59,9 +60,9 @@ services:
     image: postgres:15-alpine
     container_name: postgres
     environment:
-      POSTGRES_DB: code_review
-      POSTGRES_USER: admin
-      POSTGRES_PASSWORD: password123
+      POSTGRES_DB: ${POSTGRES_DB:-code_review}
+      POSTGRES_USER: ${POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password123}
       PGDATA: /var/lib/postgresql/data/pgdata
     ports:
       - "5432:5432"
@@ -71,29 +72,12 @@ services:
     networks:
       - ai-review-network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U admin -d code_review"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-admin} -d ${POSTGRES_DB:-code_review}"]
       interval: 30s
       timeout: 10s
       retries: 3
 
-  # Cache
-  redis:
-    image: redis:7-alpine
-    container_name: redis
-    ports:
-      - "6379:6379"
-    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
-    volumes:
-      - redis_data:/data
-    networks:
-      - ai-review-network
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-
-  # Kafka UI for debugging
+  # Kafka UI for debugging (Development only)
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: kafka-ui
@@ -107,53 +91,35 @@ services:
       KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
     networks:
       - ai-review-network
+    profiles:
+      - debug
 
-  # Git Integration Service
-  git-integration:
-    build:
-      context: ./services/git-integration
-      dockerfile: Dockerfile
-    container_name: git-integration
-    ports:
-      - "8001:8000"
-    environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      DATABASE_URL: postgresql://admin:password123@postgres:5432/code_review
-      REDIS_URL: redis://redis:6379
-      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-your-webhook-secret}
-      LOG_LEVEL: INFO
-    depends_on:
-      kafka:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    volumes:
-      - ./services/git-integration:/app
-      - ./services/shared:/app/shared
-    networks:
-      - ai-review-network
-    restart: unless-stopped
-
-  # AI Review Service
+  # 🎯 PHASE 1 SERVICES - Core MVP
+  
+  # AI Review Service (Core brain)
   ai-review:
     build:
       context: ./services/ai-review
       dockerfile: Dockerfile
     container_name: ai-review
+    ports:
+      - "${AI_REVIEW_SERVICE_PORT:-8001}:8000"
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      DATABASE_URL: postgresql://admin:password123@postgres:5432/code_review
-      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-password123}@postgres:5432/${POSTGRES_DB:-code_review}
       OPENAI_API_KEY: ${OPENAI_API_KEY}
-      LOG_LEVEL: INFO
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
+      OPENAI_MAX_TOKENS: ${OPENAI_MAX_TOKENS:-2000}
+      OPENAI_TEMPERATURE: ${OPENAI_TEMPERATURE:-0.1}
+      AI_REVIEW_TIMEOUT_SECONDS: ${AI_REVIEW_TIMEOUT_SECONDS:-60}
+      KAFKA_TOPIC_CODE_UPLOADS: ${KAFKA_TOPIC_CODE_UPLOADS:-code-uploads}
+      KAFKA_TOPIC_REVIEW_RESULTS: ${KAFKA_TOPIC_REVIEW_RESULTS:-review-results}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
     depends_on:
       kafka:
         condition: service_healthy
       postgres:
-        condition: service_healthy
-      redis:
         condition: service_healthy
     volumes:
       - ./services/ai-review:/app
@@ -162,7 +128,66 @@ services:
       - ai-review-network
     restart: unless-stopped
 
-  # Notification Service
+  # API Gateway (File upload + results API)
+  api-gateway:
+    build:
+      context: ./services/api-gateway
+      dockerfile: Dockerfile
+    container_name: api-gateway
+    ports:
+      - "${API_GATEWAY_PORT:-8003}:8000"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      DATABASE_URL: postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-password123}@postgres:5432/${POSTGRES_DB:-code_review}
+      MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-5}
+      ALLOWED_FILE_EXTENSIONS: ${ALLOWED_FILE_EXTENSIONS:-.py,.js,.java,.cpp,.c,.h,.jsx,.tsx,.ts,.go,.rs,.php,.rb}
+      UPLOAD_TIMEOUT_SECONDS: ${UPLOAD_TIMEOUT_SECONDS:-30}
+      MAX_FILES_PER_REVIEW: ${MAX_FILES_PER_REVIEW:-10}
+      KAFKA_TOPIC_CODE_UPLOADS: ${KAFKA_TOPIC_CODE_UPLOADS:-code-uploads}
+      KAFKA_TOPIC_REVIEW_RESULTS: ${KAFKA_TOPIC_REVIEW_RESULTS:-review-results}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./services/api-gateway:/app
+      - ./services/shared:/app/shared
+      - /tmp/uploads:/tmp/uploads  # Temporary file storage
+    networks:
+      - ai-review-network
+    restart: unless-stopped
+
+  # Metrics Service (Analytics + Dashboard API)
+  metrics:
+    build:
+      context: ./services/metrics
+      dockerfile: Dockerfile
+    container_name: metrics
+    ports:
+      - "${METRICS_SERVICE_PORT:-8002}:8000"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      DATABASE_URL: postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-password123}@postgres:5432/${POSTGRES_DB:-code_review}
+      KAFKA_TOPIC_CODE_UPLOADS: ${KAFKA_TOPIC_CODE_UPLOADS:-code-uploads}
+      KAFKA_TOPIC_REVIEW_RESULTS: ${KAFKA_TOPIC_REVIEW_RESULTS:-review-results}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./services/metrics:/app
+      - ./services/shared:/app/shared
+    networks:
+      - ai-review-network
+    restart: unless-stopped
+
+  # Notification Service (Email alerts - inline with metrics for simplicity)
   notification:
     build:
       context: ./services/notification
@@ -170,12 +195,15 @@ services:
     container_name: notification
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      SLACK_WEBHOOK_URL: ${SLACK_WEBHOOK_URL}
       SMTP_SERVER: ${SMTP_SERVER:-smtp.gmail.com}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_USERNAME: ${SMTP_USERNAME}
       SMTP_PASSWORD: ${SMTP_PASSWORD}
-      LOG_LEVEL: INFO
+      SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL}
+      SMTP_TO_EMAIL: ${SMTP_TO_EMAIL}
+      KAFKA_TOPIC_REVIEW_RESULTS: ${KAFKA_TOPIC_REVIEW_RESULTS:-review-results}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
     depends_on:
       kafka:
         condition: service_healthy
@@ -186,34 +214,7 @@ services:
       - ai-review-network
     restart: unless-stopped
 
-  # Metrics Service
-  metrics:
-    build:
-      context: ./services/metrics
-      dockerfile: Dockerfile
-    container_name: metrics
-    ports:
-      - "8003:8000"
-    environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      DATABASE_URL: postgresql://admin:password123@postgres:5432/code_review
-      REDIS_URL: redis://redis:6379
-      LOG_LEVEL: INFO
-    depends_on:
-      kafka:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    volumes:
-      - ./services/metrics:/app
-      - ./services/shared:/app/shared
-    networks:
-      - ai-review-network
-    restart: unless-stopped
-
-  # Frontend Dashboard
+  # Frontend Dashboard (React app)
   frontend:
     build:
       context: ./frontend
@@ -222,9 +223,10 @@ services:
     ports:
       - "3000:3000"
     environment:
-      REACT_APP_API_URL: http://localhost:8003
-      REACT_APP_WS_URL: ws://localhost:8003
+      REACT_APP_API_URL: ${REACT_APP_API_URL:-http://localhost:8003}
+      NODE_ENV: development
     depends_on:
+      - api-gateway
       - metrics
     volumes:
       - ./frontend:/app
@@ -233,11 +235,63 @@ services:
       - ai-review-network
     restart: unless-stopped
 
+  # 🔮 PHASE 2 SERVICES - Future Features (Disabled)
+  
+  # Redis Cache (Enable in Phase 2)
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: redis
+  #   ports:
+  #     - "6379:6379"
+  #   command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+  #   volumes:
+  #     - redis_data:/data
+  #   networks:
+  #     - ai-review-network
+  #   healthcheck:
+  #     test: ["CMD", "redis-cli", "ping"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 3
+  #   profiles:
+  #     - phase2
+
+  # Git Integration Service (Enable in Phase 2)
+  # git-integration:
+  #   build:
+  #     context: ./services/git-integration
+  #     dockerfile: Dockerfile
+  #   container_name: git-integration
+  #   ports:
+  #     - "${GIT_INTEGRATION_SERVICE_PORT:-8000}:8000"
+  #   environment:
+  #     KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+  #     DATABASE_URL: postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-password123}@postgres:5432/${POSTGRES_DB:-code_review}
+  #     REDIS_URL: redis://redis:6379
+  #     GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET}
+  #     GITLAB_WEBHOOK_SECRET: ${GITLAB_WEBHOOK_SECRET}
+  #     LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  #   depends_on:
+  #     kafka:
+  #       condition: service_healthy
+  #     postgres:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
+  #   volumes:
+  #     - ./services/git-integration:/app
+  #     - ./services/shared:/app/shared
+  #   networks:
+  #     - ai-review-network
+  #   restart: unless-stopped
+  #   profiles:
+  #     - phase2
+
 volumes:
   postgres_data:
-  redis_data:
   kafka_data:
   zookeeper_data:
+  # redis_data:  # Uncomment for Phase 2
 
 networks:
   ai-review-network:
