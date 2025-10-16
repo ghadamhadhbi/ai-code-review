@@ -1,10 +1,9 @@
-version: '3.8'
 
 services:
   # Kafka Infrastructure
   zookeeper:
-    image: confluentinc/cp-zookeeper:7.4.0
-    container_name: zookeeper
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: ai-review-zookeeper
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
@@ -14,28 +13,34 @@ services:
       - zookeeper_data:/var/lib/zookeeper/data
     networks:
       - ai-review-network
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 2181 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   kafka:
-    image: confluentinc/cp-kafka:7.4.0
-    container_name: kafka
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: ai-review-kafka
     depends_on:
-      - zookeeper
+      zookeeper:
+        condition: service_healthy
     ports:
       - "9092:9092"
+      - "29092:29092"
       - "9101:9101"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
-      KAFKA_METRIC_REPORTERS: io.confluent.metrics.reporter.ConfluentMetricsReporter
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-      KAFKA_CONFLUENT_METRICS_REPORTER_BOOTSTRAP_SERVERS: kafka:29092
-      KAFKA_CONFLUENT_METRICS_REPORTER_TOPIC_REPLICAS: 1
-      KAFKA_CONFLUENT_METRICS_ENABLE: "true"
-      KAFKA_CONFLUENT_SUPPORT_CUSTOMER_ID: anonymous
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
       KAFKA_LOG_RETENTION_HOURS: 168
       KAFKA_LOG_RETENTION_BYTES: 1073741824
     volumes:
@@ -43,26 +48,20 @@ services:
     networks:
       - ai-review-network
     healthcheck:
-      test:
-        [
-          "CMD",
-          "kafka-topics",
-          "--bootstrap-server",
-          "localhost:9092",
-          "--list",
-        ]
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092"]
       interval: 30s
       timeout: 10s
-      retries: 3
+      retries: 5
+      start_period: 60s
 
   # Database
   postgres:
     image: postgres:15-alpine
-    container_name: postgres
+    container_name: ai-review-postgres
     environment:
-      POSTGRES_DB: ${POSTGRES_DB:-code_review}
-      POSTGRES_USER: ${POSTGRES_USER:-admin}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password123}
+      POSTGRES_DB: ${POSTGRES_DB:-ai_code_review}
+      POSTGRES_USER: ${POSTGRES_USER:-aireviewer}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-SecurePass123!}
       PGDATA: /var/lib/postgresql/data/pgdata
     ports:
       - "5432:5432"
@@ -72,17 +71,18 @@ services:
     networks:
       - ai-review-network
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-admin} -d ${POSTGRES_DB:-code_review}"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aireviewer} -d ${POSTGRES_DB:-ai_code_review}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   # Kafka UI for debugging (Development only)
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: kafka-ui
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
     ports:
       - "8080:8080"
     environment:
@@ -96,26 +96,35 @@ services:
 
   # 🎯 PHASE 1 SERVICES - Core MVP
   
-  # AI Review Service (Core brain)
+  # AI Review Service (Core brain - Groq-powered)
   ai-review:
     build:
       context: ./services/ai-review
       dockerfile: Dockerfile
-    container_name: ai-review
+    container_name: ai-review-service
     ports:
       - "${AI_REVIEW_SERVICE_PORT:-8001}:8000"
     environment:
+      # Kafka - Internal communication
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      DATABASE_URL: postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-password123}@postgres:5432/${POSTGRES_DB:-code_review}
-      OPENAI_API_KEY: ${OPENAI_API_KEY}
-      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
-      OPENAI_MAX_TOKENS: ${OPENAI_MAX_TOKENS:-2000}
-      OPENAI_TEMPERATURE: ${OPENAI_TEMPERATURE:-0.1}
-      AI_REVIEW_TIMEOUT_SECONDS: ${AI_REVIEW_TIMEOUT_SECONDS:-60}
       KAFKA_TOPIC_CODE_UPLOADS: ${KAFKA_TOPIC_CODE_UPLOADS:-code-uploads}
       KAFKA_TOPIC_REVIEW_RESULTS: ${KAFKA_TOPIC_REVIEW_RESULTS:-review-results}
+      
+      # Database
+      DATABASE_URL: postgresql://${POSTGRES_USER:-aireviewer}:${POSTGRES_PASSWORD:-SecurePass123!}@postgres:5432/${POSTGRES_DB:-ai_code_review}
+      
+      # Groq API Configuration
+      GROQ_API_KEY: ${GROQ_API_KEY}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.1-70b-versatile}
+      GROQ_MAX_TOKENS: ${GROQ_MAX_TOKENS:-4000}
+      GROQ_TEMPERATURE: ${GROQ_TEMPERATURE:-0.7}
+      AI_REVIEW_TIMEOUT_SECONDS: ${AI_REVIEW_TIMEOUT_SECONDS:-60}
+      
+      # Application
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       ENVIRONMENT: ${ENVIRONMENT:-development}
+      DEBUG: ${DEBUG:-true}
+      
     depends_on:
       kafka:
         condition: service_healthy
@@ -124,57 +133,98 @@ services:
     volumes:
       - ./services/ai-review:/app
       - ./services/shared:/app/shared
+      - shared_uploads:/tmp/uploads
     networks:
       - ai-review-network
     restart: unless-stopped
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --no-access-log
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
 
-  # API Gateway (File upload + results API)
+  # API Gateway (File upload + results API + WebSocket)
   api-gateway:
     build:
       context: ./services/api-gateway
       dockerfile: Dockerfile
-    container_name: api-gateway
+    container_name: ai-review-api-gateway
     ports:
-      - "${API_GATEWAY_PORT:-8003}:8000"
+      - "${API_GATEWAY_PORT:-8000}:8000"
     environment:
+      # Service Communication
+      AI_REVIEW_SERVICE_URL: http://ai-review:8000
+      
+      # Kafka - Internal communication
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      DATABASE_URL: postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-password123}@postgres:5432/${POSTGRES_DB:-code_review}
-      MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-5}
-      ALLOWED_FILE_EXTENSIONS: ${ALLOWED_FILE_EXTENSIONS:-.py,.js,.java,.cpp,.c,.h,.jsx,.tsx,.ts,.go,.rs,.php,.rb}
-      UPLOAD_TIMEOUT_SECONDS: ${UPLOAD_TIMEOUT_SECONDS:-30}
-      MAX_FILES_PER_REVIEW: ${MAX_FILES_PER_REVIEW:-10}
       KAFKA_TOPIC_CODE_UPLOADS: ${KAFKA_TOPIC_CODE_UPLOADS:-code-uploads}
       KAFKA_TOPIC_REVIEW_RESULTS: ${KAFKA_TOPIC_REVIEW_RESULTS:-review-results}
+      
+      # Database
+      DATABASE_URL: postgresql://${POSTGRES_USER:-aireviewer}:${POSTGRES_PASSWORD:-SecurePass123!}@postgres:5432/${POSTGRES_DB:-ai_code_review}
+      
+      # File Upload Settings
+      MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-5}
+      ALLOWED_FILE_EXTENSIONS: ${ALLOWED_FILE_EXTENSIONS:-.py,.js,.java,.cpp,.c,.h,.jsx,.tsx,.ts,.go,.rs,.php,.rb}
+      UPLOAD_TIMEOUT_SECONDS: ${UPLOAD_TIMEOUT_SECONDS:-300}
+      MAX_FILES_PER_REVIEW: ${MAX_FILES_PER_REVIEW:-10}
+      UPLOAD_DIR: /tmp/uploads
+      
+      # WebSocket Settings
+      WS_PING_INTERVAL: 20
+      WS_PING_TIMEOUT: 20
+      
+      # Application
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       ENVIRONMENT: ${ENVIRONMENT:-development}
+      DEBUG: ${DEBUG:-true}
+      
     depends_on:
       kafka:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      ai-review:
+        condition: service_healthy
     volumes:
       - ./services/api-gateway:/app
       - ./services/shared:/app/shared
-      - /tmp/uploads:/tmp/uploads  # Temporary file storage
+      - shared_uploads:/tmp/uploads
     networks:
       - ai-review-network
     restart: unless-stopped
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --no-access-log
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
 
   # Metrics Service (Analytics + Dashboard API)
   metrics:
     build:
       context: ./services/metrics
       dockerfile: Dockerfile
-    container_name: metrics
+    container_name: ai-review-metrics
     ports:
       - "${METRICS_SERVICE_PORT:-8002}:8000"
     environment:
+      # Kafka - Internal communication
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      DATABASE_URL: postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-password123}@postgres:5432/${POSTGRES_DB:-code_review}
       KAFKA_TOPIC_CODE_UPLOADS: ${KAFKA_TOPIC_CODE_UPLOADS:-code-uploads}
       KAFKA_TOPIC_REVIEW_RESULTS: ${KAFKA_TOPIC_REVIEW_RESULTS:-review-results}
+      
+      # Database
+      DATABASE_URL: postgresql://${POSTGRES_USER:-aireviewer}:${POSTGRES_PASSWORD:-SecurePass123!}@postgres:5432/${POSTGRES_DB:-ai_code_review}
+      
+      # Application
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       ENVIRONMENT: ${ENVIRONMENT:-development}
+      DEBUG: ${DEBUG:-true}
+      
     depends_on:
       kafka:
         condition: service_healthy
@@ -186,24 +236,37 @@ services:
     networks:
       - ai-review-network
     restart: unless-stopped
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --no-access-log
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
-  # Notification Service (Email alerts - inline with metrics for simplicity)
+  # Notification Service (Email alerts)
   notification:
     build:
       context: ./services/notification
       dockerfile: Dockerfile
-    container_name: notification
+    container_name: ai-review-notification
     environment:
+      # Kafka - Internal communication
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_TOPIC_REVIEW_RESULTS: ${KAFKA_TOPIC_REVIEW_RESULTS:-review-results}
+      
+      # SMTP Configuration
       SMTP_SERVER: ${SMTP_SERVER:-smtp.gmail.com}
       SMTP_PORT: ${SMTP_PORT:-587}
       SMTP_USERNAME: ${SMTP_USERNAME}
       SMTP_PASSWORD: ${SMTP_PASSWORD}
       SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL}
       SMTP_TO_EMAIL: ${SMTP_TO_EMAIL}
-      KAFKA_TOPIC_REVIEW_RESULTS: ${KAFKA_TOPIC_REVIEW_RESULTS:-review-results}
+      
+      # Application
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       ENVIRONMENT: ${ENVIRONMENT:-development}
+      DEBUG: ${DEBUG:-true}
+      
     depends_on:
       kafka:
         condition: service_healthy
@@ -219,21 +282,26 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
-    container_name: frontend
+    container_name: ai-review-frontend
     ports:
       - "3000:3000"
     environment:
-      REACT_APP_API_URL: ${REACT_APP_API_URL:-http://localhost:8003}
-      NODE_ENV: development
+      REACT_APP_API_URL: http://localhost:8003
+      REACT_APP_WS_URL: ws://localhost:8003
+      NODE_ENV: ${NODE_ENV:-development}
     depends_on:
-      - api-gateway
-      - metrics
+      api-gateway:
+        condition: service_healthy
+      metrics:
+        condition: service_started
     volumes:
       - ./frontend:/app
       - /app/node_modules
     networks:
       - ai-review-network
     restart: unless-stopped
+    stdin_open: true
+    tty: true
 
   # 🔮 PHASE 2 SERVICES - Future Features (Disabled)
   
@@ -265,7 +333,7 @@ services:
   #   ports:
   #     - "${GIT_INTEGRATION_SERVICE_PORT:-8000}:8000"
   #   environment:
-  #     KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+  #     KAFKA_BOOTSTRAP_SERVERS: kafka:9092
   #     DATABASE_URL: postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-password123}@postgres:5432/${POSTGRES_DB:-code_review}
   #     REDIS_URL: redis://redis:6379
   #     GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET}
@@ -291,6 +359,7 @@ volumes:
   postgres_data:
   kafka_data:
   zookeeper_data:
+  shared_uploads:
   # redis_data:  # Uncomment for Phase 2
 
 networks:

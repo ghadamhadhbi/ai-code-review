@@ -1,51 +1,33 @@
 """
-Upload API endpoints
-Handles file uploads and triggers AI code review
+Upload API endpoints - FIXED - Files persist correctly
+Handles file uploads with proper database storage
 """
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
-from fastapi.responses import JSONResponse
 from typing import List, Optional
 import structlog
-import asyncio
 import uuid
 import os
-import json
 from datetime import datetime
 
 from core.config import settings
-from core.kafka_producer import KafkaProducer
+from services.kafka_producer import get_kafka_producer
 from core.database import get_db_session
-from models.upload import UploadRequest, UploadResponse, FileInfo
-from services.file_service import FileService
-from utils.validators import validate_files
-from core.exceptions import ValidationError, ProcessingError
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
 
-# Initialize services
-file_service = FileService()
-kafka_producer = KafkaProducer()
 
-
-@router.post("/", response_model=UploadResponse)
+@router.post("/")
 async def upload_files(
-    files: List[UploadFile] = File(..., description="Code files to analyze"),
-    author_email: Optional[str] = Form(None, description="Author email for notifications"),
-    description: Optional[str] = Form(None, description="Review description"),
-    language: Optional[str] = Form(None, description="Primary programming language"),
+    files: List[UploadFile] = File(...),
+    author_email: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
+    language: Optional[str] = Form(None),
     db_session = Depends(get_db_session)
-) -> UploadResponse:
+):
     """
-    Upload code files for AI review analysis
-    
-    - **files**: List of code files (max 10 files, 5MB each)
-    - **author_email**: Email for notifications (optional)
-    - **description**: Description of the code review (optional)
-    - **language**: Primary programming language (optional)
-    
-    Returns upload session ID and status
+    ✅ FIX: Upload code files - ensures persistence in database
     """
     upload_id = str(uuid.uuid4())
     
@@ -57,39 +39,85 @@ async def upload_files(
     )
     
     try:
-        # Validate upload request
-        validate_files(files, settings)
+        # Validate files
+        if not files or len(files) == 0:
+            raise HTTPException(status_code=400, detail="No files provided")
+        
+        max_files = getattr(settings, 'MAX_FILES_PER_REVIEW', 10)
+        if len(files) > max_files:
+            raise HTTPException(status_code=400, detail=f"Maximum {max_files} files allowed")
         
         # Process uploaded files
         processed_files = []
         total_size = 0
+        upload_dir = f"/tmp/uploads/{upload_id}"
+        os.makedirs(upload_dir, exist_ok=True)
         
         for file in files:
-            # Validate individual file
             if not file.filename:
-                raise ValidationError("File must have a filename")
+                continue
+                
+            # Read file content
+            content = await file.read()
+            file_size = len(content)
             
-            file_info = await file_service.process_upload_file(file, upload_id)
+            # Check file size
+            max_size = getattr(settings, 'MAX_FILE_SIZE_MB', 5) * 1024 * 1024
+            if file_size > max_size:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"File {file.filename} exceeds maximum size of {settings.MAX_FILE_SIZE_MB}MB"
+                )
+            
+            # Save file
+            file_path = os.path.join(upload_dir, file.filename)
+            with open(file_path, 'wb') as f:
+                f.write(content)
+            
+            # Detect language from extension
+            extension = os.path.splitext(file.filename)[1]
+            detected_lang = _detect_language(extension)
+            
+            file_info = {
+                "filename": file.filename,
+                "filepath": file_path,
+                "extension": extension,
+                "size_bytes": file_size,
+                "content_type": file.content_type or "text/plain",
+                "detected_language": detected_lang,
+                "file_type": extension
+            }
+            
             processed_files.append(file_info)
-            total_size += file_info.size_bytes
+            total_size += file_size
             
-            logger.debug(
-                "File processed",
-                upload_id=upload_id,
-                filename=file_info.filename,
-                size=file_info.size_bytes,
-            )
+            logger.debug("File processed", filename=file.filename, size=file_size)
         
-        # Store upload record in database
-        upload_record = await _create_upload_record(
-            db_session=db_session,
-            upload_id=upload_id,
-            files=processed_files,
-            author_email=author_email,
-            description=description,
-            language=language,
-            total_size=total_size
-        )
+        # ✅ FIX: Create upload record in database with proper error handling
+        try:
+            if hasattr(db_session, '__aenter__'):
+                async with db_session as conn:
+                    await _create_upload_record(
+                        conn, upload_id, processed_files, author_email,
+                        description, language, total_size
+                    )
+            else:
+                await _create_upload_record(
+                    db_session, upload_id, processed_files, author_email,
+                    description, language, total_size
+                )
+            
+            logger.info("✅ Upload record created in database", upload_id=upload_id)
+            
+        except Exception as e:
+            logger.error("Database error during upload", upload_id=upload_id, error=str(e))
+            # Clean up files
+            for file_info in processed_files:
+                try:
+                    os.remove(file_info["filepath"])
+                except:
+                    pass
+            raise HTTPException(status_code=500, detail=f"Failed to save upload: {str(e)}")
         
         # Prepare Kafka event
         upload_event = {
@@ -97,245 +125,225 @@ async def upload_files(
             "timestamp": datetime.utcnow().isoformat(),
             "author_email": author_email,
             "description": description,
-            "language": language,
-            "files": [
-                {
-                    "filename": f.filename,
-                    "filepath": f.filepath,
-                    "size_bytes": f.size_bytes,
-                    "extension": f.extension,
-                    "content_type": f.content_type,
-                    "language": f.detected_language,
-                }
-                for f in processed_files
-            ],
+            "language": language or (processed_files[0]["detected_language"] if processed_files else None),
+            "files": processed_files,
             "total_size_bytes": total_size,
             "file_count": len(processed_files),
         }
         
         # Publish to Kafka
-        await kafka_producer.publish_upload_event(upload_event)
+        try:
+            kafka_producer = get_kafka_producer()
+            await kafka_producer.publish_upload_event(upload_event)
+            logger.info("✅ Upload event published to Kafka", upload_id=upload_id)
+        except Exception as e:
+            logger.error("Kafka publishing error", upload_id=upload_id, error=str(e))
+            # Continue despite Kafka failure - upload is in database
         
         logger.info(
-            "Upload completed successfully",
+            "✅ Upload completed successfully",
             upload_id=upload_id,
             file_count=len(processed_files),
             total_size=total_size,
         )
         
         # Return success response
-        return UploadResponse(
-            upload_id=upload_id,
-            status="uploaded",
-            message="Files uploaded successfully and queued for review",
-            file_count=len(processed_files),
-            total_size_bytes=total_size,
-            files=[
-                FileInfo(
-                    filename=f.filename,
-                    size_bytes=f.size_bytes,
-                    extension=f.extension,
-                    content_type=f.content_type,
-                    detected_language=f.detected_language,
-                )
+        return {
+            "upload_id": upload_id,
+            "status": "uploaded",
+            "message": "Files uploaded successfully and queued for review",
+            "file_count": len(processed_files),
+            "total_size_bytes": total_size,
+            "files": [
+                {
+                    "filename": f["filename"],
+                    "size_bytes": f["size_bytes"],
+                    "extension": f["extension"],
+                    "content_type": f["content_type"],
+                    "detected_language": f["detected_language"],
+                }
                 for f in processed_files
             ],
-            estimated_processing_time=_estimate_processing_time(processed_files),
-        )
+            "estimated_processing_time": f"{10 + len(processed_files) * 5} seconds",
+        }
         
-    except ValidationError as e:
-        logger.warning(
-            "Upload validation failed",
-            upload_id=upload_id,
-            error=e.message,
-        )
-        # Cleanup any partial files
-        await file_service.cleanup_upload(upload_id)
-        raise HTTPException(status_code=400, detail=e.message)
-        
-    except ProcessingError as e:
-        logger.error(
-            "Upload processing failed",
-            upload_id=upload_id,
-            error=e.message,
-        )
-        # Cleanup any partial files
-        await file_service.cleanup_upload(upload_id)
-        raise HTTPException(status_code=500, detail=e.message)
-        
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(
-            "Unexpected upload error",
-            upload_id=upload_id,
-            error=str(e),
+        logger.error("Unexpected upload error", upload_id=upload_id, error=str(e))
+        raise HTTPException(status_code=500, detail=f"Upload processing failed: {str(e)}")
+
+
+async def _create_upload_record(conn, upload_id: str, files: List, 
+                               author_email: Optional[str], description: Optional[str],
+                               language: Optional[str], total_size: int):
+    """
+    ✅ FIX: Create upload record with proper transaction handling
+    """
+    
+    # Insert upload record
+    insert_query = """
+        INSERT INTO uploads (
+            id, author_email, description, language, 
+            file_count, total_size_bytes, status, created_at, updated_at, progress
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, 'uploaded', NOW(), NOW(), 10
         )
-        # Cleanup any partial files
-        await file_service.cleanup_upload(upload_id)
-        raise HTTPException(status_code=500, detail="Upload processing failed")
+    """
+    
+    await conn.execute(
+        insert_query,
+        upload_id, author_email, description, language, len(files), total_size
+    )
+    
+    logger.debug("Inserted upload record", upload_id=upload_id)
+    
+    # ✅ FIX: Insert file records with proper field mapping
+    for file_info in files:
+        file_insert_query = """
+            INSERT INTO upload_files (
+                upload_id, filename, filepath, file_type, size_bytes,
+                detected_language, content_type, created_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, NOW()
+            )
+        """
+        
+        await conn.execute(
+            file_insert_query,
+            upload_id,
+            file_info["filename"],
+            file_info["filepath"],
+            file_info["extension"],  # file_type
+            file_info["size_bytes"],
+            file_info["detected_language"],
+            file_info["content_type"]
+        )
+        
+        logger.debug("Inserted file record", filename=file_info["filename"])
+    
+    logger.info("✅ Upload and file records inserted", upload_id=upload_id, file_count=len(files))
 
 
-@router.get("/status/{upload_id}")
+def _detect_language(extension: str) -> str:
+    """Detect programming language from file extension"""
+    lang_map = {
+        ".py": "python",
+        ".js": "javascript",
+        ".jsx": "javascript",
+        ".ts": "typescript",
+        ".tsx": "typescript",
+        ".java": "java",
+        ".cpp": "cpp",
+        ".c": "c",
+        ".h": "c",
+        ".hpp": "cpp",
+        ".go": "go",
+        ".rs": "rust",
+        ".php": "php",
+        ".rb": "ruby",
+        ".swift": "swift",
+        ".kt": "kotlin",
+        ".cs": "csharp",
+        ".html": "html",
+        ".css": "css",
+        ".sql": "sql",
+    }
+    return lang_map.get(extension.lower(), "unknown")
+
+
+@router.get("/{upload_id}")
 async def get_upload_status(
     upload_id: str,
     db_session = Depends(get_db_session)
 ):
     """
-    Get the status of an upload and its review progress
-    
-    - **upload_id**: The upload session ID
-    
-    Returns current status and progress information
+    ✅ FIX: Get upload status - shows current progress
     """
     try:
-        # Query database for upload status
-        upload_record = await _get_upload_record(db_session, upload_id)
-        
-        if not upload_record:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Upload {upload_id} not found"
-            )
-        
-        return {
-            "upload_id": upload_id,
-            "status": upload_record["status"],
-            "created_at": upload_record["created_at"],
-            "updated_at": upload_record["updated_at"],
-            "file_count": upload_record["file_count"],
-            "total_size_bytes": upload_record["total_size_bytes"],
-            "progress": upload_record.get("progress", 0),
-            "error_message": upload_record.get("error_message"),
-        }
+        if hasattr(db_session, '__aenter__'):
+            async with db_session as conn:
+                return await _fetch_upload_status(conn, upload_id)
+        else:
+            return await _fetch_upload_status(db_session, upload_id)
         
     except HTTPException:
         raise
     except Exception as e:
         logger.error("Failed to get upload status", upload_id=upload_id, error=str(e))
-        raise HTTPException(status_code=500, detail="Failed to retrieve upload status")
+        raise HTTPException(status_code=500, detail=f"Failed to get upload status: {str(e)}")
 
 
-@router.delete("/{upload_id}")
-async def cancel_upload(
-    upload_id: str,
-    db_session = Depends(get_db_session)
-):
-    """
-    Cancel an upload and cleanup associated files
+async def _fetch_upload_status(conn, upload_id: str):
+    """Fetch upload status from database"""
     
-    - **upload_id**: The upload session ID to cancel
-    
-    Returns confirmation of cancellation
-    """
-    try:
-        # Check if upload exists and is cancellable
-        upload_record = await _get_upload_record(db_session, upload_id)
-        
-        if not upload_record:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Upload {upload_id} not found"
-            )
-        
-        if upload_record["status"] in ["completed", "failed"]:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Cannot cancel upload with status: {upload_record['status']}"
-            )
-        
-        # Update status to cancelled
-        await _update_upload_status(db_session, upload_id, "cancelled")
-        
-        # Cleanup files
-        await file_service.cleanup_upload(upload_id)
-        
-        logger.info("Upload cancelled", upload_id=upload_id)
-        
-        return {
-            "upload_id": upload_id,
-            "status": "cancelled",
-            "message": "Upload cancelled and files cleaned up"
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("Failed to cancel upload", upload_id=upload_id, error=str(e))
-        raise HTTPException(status_code=500, detail="Failed to cancel upload")
-
-
-# Helper functions
-
-async def _create_upload_record(db_session, upload_id: str, files: List, 
-                               author_email: Optional[str], description: Optional[str],
-                               language: Optional[str], total_size: int) -> dict:
-    """Create upload record in database"""
     query = """
-        INSERT INTO uploads (
-            id, author_email, description, language, 
-            file_count, total_size_bytes, status, created_at
-        ) VALUES (
-            :id, :author_email, :description, :language,
-            :file_count, :total_size_bytes, 'uploaded', NOW()
-        )
+        SELECT 
+            id,
+            status,
+            progress,
+            author_email,
+            description,
+            language,
+            file_count,
+            total_size_bytes,
+            created_at,
+            updated_at,
+            error_message
+        FROM uploads
+        WHERE id = $1
     """
     
-    await db_session.execute(query, {
-        "id": upload_id,
-        "author_email": author_email,
-        "description": description,
-        "language": language,
-        "file_count": len(files),
-        "total_size_bytes": total_size,
-    })
-    await db_session.commit()
+    row = await conn.fetchrow(query, upload_id)
+    
+    if not row:
+        raise HTTPException(status_code=404, detail="Upload not found")
+    
+    # Get file list
+    files_query = """
+        SELECT filename, file_type, size_bytes, detected_language
+        FROM upload_files
+        WHERE upload_id = $1
+        ORDER BY created_at
+    """
+    
+    file_rows = await conn.fetch(files_query, upload_id)
+    
+    files = [
+        {
+            "filename": f["filename"],
+            "file_type": f["file_type"],
+            "size_bytes": f["size_bytes"],
+            "detected_language": f["detected_language"]
+        }
+        for f in file_rows
+    ]
+    
+    # Check if review exists
+    review_query = """
+        SELECT id, status, overall_score, created_at, completed_at
+        FROM review_results
+        WHERE upload_id = $1
+        ORDER BY created_at DESC
+        LIMIT 1
+    """
+    
+    review = await conn.fetchrow(review_query, upload_id)
     
     return {
-        "upload_id": upload_id,
-        "status": "uploaded",
-        "file_count": len(files),
-        "total_size_bytes": total_size,
+        "upload_id": row["id"],
+        "status": row["status"],
+        "progress": row["progress"] or 0,
+        "author_email": row["author_email"],
+        "description": row["description"],
+        "language": row["language"],
+        "file_count": row["file_count"],
+        "total_size_bytes": row["total_size_bytes"],
+        "files": files,
+        "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
+        "error_message": row["error_message"],
+        "review_id": review["id"] if review else None,
+        "review_status": review["status"] if review else None,
+        "review_score": review["overall_score"] if review else None
     }
-
-
-async def _get_upload_record(db_session, upload_id: str) -> Optional[dict]:
-    """Get upload record from database"""
-    query = """
-        SELECT id, status, created_at, updated_at, file_count, 
-               total_size_bytes, error_message
-        FROM uploads WHERE id = :upload_id
-    """
-    
-    result = await db_session.execute(query, {"upload_id": upload_id})
-    row = result.fetchone()
-    
-    if row:
-        return dict(row)
-    return None
-
-
-async def _update_upload_status(db_session, upload_id: str, status: str, 
-                               error_message: Optional[str] = None):
-    """Update upload status in database"""
-    query = """
-        UPDATE uploads 
-        SET status = :status, updated_at = NOW(), error_message = :error_message
-        WHERE id = :upload_id
-    """
-    
-    await db_session.execute(query, {
-        "upload_id": upload_id,
-        "status": status,
-        "error_message": error_message,
-    })
-    await db_session.commit()
-
-
-def _estimate_processing_time(files: List) -> int:
-    """Estimate processing time based on file count and size"""
-    base_time = 10  # Base processing time in seconds
-    file_time = len(files) * 5  # 5 seconds per file
-    
-    total_size_mb = sum(f.size_bytes for f in files) / (1024 * 1024)
-    size_time = int(total_size_mb * 2)  # 2 seconds per MB
-    
-    return base_time + file_time + size_time

@@ -15,6 +15,7 @@ asyncpg==0.29.0
 # Kafka
 kafka-python==2.0.2
 confluent-kafka==2.3.0
+aiokafka==0.8.1
 
 # File handling
 python-multipart==0.0.6

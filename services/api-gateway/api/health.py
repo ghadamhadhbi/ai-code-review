@@ -12,7 +12,7 @@ from typing import Dict, Any, Optional
 
 from core.config import settings
 from core.database import test_connection as test_db
-from core.kafka_producer import test_connection as test_kafka
+from services.kafka_producer import test_connection as test_kafka
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
