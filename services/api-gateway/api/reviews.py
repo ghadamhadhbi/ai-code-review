@@ -3,6 +3,7 @@ Reviews API endpoints - FIXED - Reviews persist correctly
 Retrieves and manages code reviews with proper database queries
 """
 
+import os
 from fastapi import APIRouter, Query, Depends, HTTPException
 from typing import Optional
 import structlog
@@ -13,6 +14,8 @@ from core.database import get_db_session
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
+
+METRICS_SERVICE_URL = os.getenv("METRICS_SERVICE_URL", "http://metrics:8000")
 
 
 @router.get("/stats")

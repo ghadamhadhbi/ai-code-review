@@ -1,190 +1,99 @@
-"""
-Metrics Service - Dashboard API and Analytics Endpoints
-"""
 
 # =====================================================
 # services/metrics/api/dashboard.py
 # =====================================================
 
-from fastapi import APIRouter, HTTPException, Depends, Query
-from typing import List, Dict, Any, Optional
-import structlog
+from fastapi import APIRouter, Query
 from datetime import datetime, timedelta
+import structlog
 
-from core.database import (
-    get_db_session, get_dashboard_overview, 
-    get_daily_activity, get_language_distribution
-)
+from core.database import db_pool
 
-logger = structlog.get_logger(__name__)
 router = APIRouter()
+logger = structlog.get_logger(__name__)
 
 
-@router.get("/overview")
-async def get_dashboard_overview_endpoint(
-    days: int = Query(default=7, le=90, description="Number of days for overview")
-):
-    """Get dashboard overview metrics"""
+@router.get("/reviews/stats")
+async def get_review_stats(days: int = Query(7, ge=1, le=90)):
+    """Get review statistics for dashboard"""
     try:
-        logger.info("Fetching dashboard overview", days=days)
+        since_date = datetime.utcnow() - timedelta(days=days)
         
-        overview = await get_dashboard_overview(days)
-        
-        return {
-            "period": {
-                "days": days,
-                "start_date": (datetime.utcnow() - timedelta(days=days)).isoformat(),
-                "end_date": datetime.utcnow().isoformat(),
-            },
-            "metrics": overview
-        }
-        
-    except Exception as e:
-        logger.error("Failed to fetch dashboard overview", error=str(e))
-        raise HTTPException(status_code=500, detail="Failed to retrieve dashboard overview")
-
-
-@router.get("/activity")
-async def get_daily_activity_endpoint(
-    days: int = Query(default=30, le=90, description="Number of days for activity data")
-):
-    """Get daily activity trends"""
-    try:
-        logger.info("Fetching daily activity", days=days)
-        
-        activity = await get_daily_activity(days)
-        
-        return {
-            "period": {
-                "days": days,
-                "data_points": len(activity)
-            },
-            "activity": activity
-        }
-        
-    except Exception as e:
-        logger.error("Failed to fetch daily activity", error=str(e))
-        raise HTTPException(status_code=500, detail="Failed to retrieve activity data")
-
-
-@router.get("/languages")
-async def get_language_distribution_endpoint(
-    days: int = Query(default=30, le=90, description="Number of days for language data")
-):
-    """Get programming language distribution"""
-    try:
-        logger.info("Fetching language distribution", days=days)
-        
-        languages = await get_language_distribution(days)
-        
-        return {
-            "period": {
-                "days": days,
-                "languages_count": len(languages)
-            },
-            "languages": languages
-        }
-        
-    except Exception as e:
-        logger.error("Failed to fetch language distribution", error=str(e))
-        raise HTTPException(status_code=500, detail="Failed to retrieve language data")
-
-
-@router.get("/health-status")
-async def get_system_health():
-    """Get current system health metrics"""
-    try:
-        async with get_db_session() as db:
-            # Recent activity (last hour)
-            recent_activity = await db.fetchrow("""
-                SELECT 
-                    COUNT(*) as reviews_last_hour,
-                    COUNT(*) FILTER (WHERE status = 'failed') as failures_last_hour
+        async with db_pool.acquire() as conn:
+            # Total reviews
+            total_reviews = await conn.fetchval(
+                "SELECT COUNT(*) FROM review_results WHERE created_at >= $1",
+                since_date
+            )
+            
+            # Status breakdown
+            status_counts = await conn.fetch("""
+                SELECT status, COUNT(*) as count
                 FROM review_results
-                WHERE created_at >= NOW() - INTERVAL '1 hour'
-            """)
+                WHERE created_at >= $1
+                GROUP BY status
+            """, since_date)
             
-            # Queue status
-            queue_status = await db.fetchrow("""
-                SELECT 
-                    COUNT(*) as pending_reviews,
-                    MIN(created_at) as oldest_pending
+            pending = sum(r['count'] for r in status_counts if r['status'] == 'pending')
+            processing = sum(r['count'] for r in status_counts if r['status'] == 'processing')
+            completed = sum(r['count'] for r in status_counts if r['status'] == 'completed')
+            failed = sum(r['count'] for r in status_counts if r['status'] == 'failed')
+            
+            # Average score
+            avg_score = await conn.fetchval("""
+                SELECT AVG(overall_score)::numeric(10,2)
                 FROM review_results
-                WHERE status = 'pending'
-            """)
+                WHERE created_at >= $1 AND overall_score IS NOT NULL
+            """, since_date)
             
-            # Error rate (last 24 hours)
-            error_metrics = await db.fetchrow("""
-                SELECT 
-                    COUNT(*) as total_attempts,
-                    COUNT(*) FILTER (WHERE status = 'failed') as failures
+            # Average processing time
+            avg_time = await conn.fetchval("""
+                SELECT AVG(processing_time_ms)::integer
                 FROM review_results
-                WHERE created_at >= NOW() - INTERVAL '24 hours'
-            """)
+                WHERE created_at >= $1 AND processing_time_ms IS NOT NULL
+            """, since_date)
             
-            # Performance metrics
-            performance = await db.fetchrow("""
-                SELECT 
-                    AVG(processing_time_ms) as avg_time,
-                    MAX(processing_time_ms) as max_time,
-                    PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY processing_time_ms) as p95_time
+            # Total suggestions
+            total_suggestions = await conn.fetchval("""
+                SELECT COUNT(*)
+                FROM review_suggestions rs
+                JOIN review_results rr ON rs.review_result_id = rr.id
+                WHERE rr.created_at >= $1
+            """, since_date)
+            
+            # Total tokens
+            total_tokens = await conn.fetchval("""
+                SELECT COALESCE(SUM(tokens_used), 0)
                 FROM review_results
-                WHERE created_at >= NOW() - INTERVAL '24 hours' 
-                AND processing_time_ms > 0
-            """)
-            
-            # Calculate health indicators
-            error_rate = 0
-            if error_metrics["total_attempts"] and error_metrics["total_attempts"] > 0:
-                error_rate = (error_metrics["failures"] or 0) / error_metrics["total_attempts"] * 100
-            
-            pending_count = queue_status["pending_reviews"] or 0
-            queue_health = "healthy"
-            if pending_count > 50:
-                queue_health = "degraded"
-            elif pending_count > 100:
-                queue_health = "unhealthy"
-            
-            avg_time = performance["avg_time"] or 0
-            performance_health = "healthy"
-            if avg_time > 30000:  # 30 seconds
-                performance_health = "degraded"
-            elif avg_time > 60000:  # 1 minute
-                performance_health = "unhealthy"
-            
-            # Overall health
-            overall_health = "healthy"
-            if error_rate > 10 or queue_health == "unhealthy" or performance_health == "unhealthy":
-                overall_health = "unhealthy"
-            elif error_rate > 5 or queue_health == "degraded" or performance_health == "degraded":
-                overall_health = "degraded"
+                WHERE created_at >= $1
+            """, since_date)
             
             return {
-                "timestamp": datetime.utcnow().isoformat(),
-                "overall_health": overall_health,
-                "activity": {
-                    "reviews_last_hour": recent_activity["reviews_last_hour"] or 0,
-                    "failures_last_hour": recent_activity["failures_last_hour"] or 0,
-                },
-                "queue": {
-                    "pending_reviews": pending_count,
-                    "oldest_pending": queue_status["oldest_pending"].isoformat() if queue_status["oldest_pending"] else None,
-                    "health": queue_health,
-                },
-                "errors": {
-                    "error_rate_24h": round(error_rate, 2),
-                    "total_attempts_24h": error_metrics["total_attempts"] or 0,
-                    "failures_24h": error_metrics["failures"] or 0,
-                },
-                "performance": {
-                    "avg_processing_time_ms": round(float(avg_time), 1),
-                    "max_processing_time_ms": performance["max_time"] or 0,
-                    "p95_processing_time_ms": round(float(performance["p95_time"] or 0), 1),
-                    "health": performance_health,
-                },
+                "period_days": days,
+                "total_reviews": total_reviews or 0,
+                "pending_reviews": pending or 0,
+                "processing_reviews": processing or 0,
+                "completed_reviews": completed or 0,
+                "failed_reviews": failed or 0,
+                "average_score": float(avg_score) if avg_score else None,
+                "average_processing_time_ms": avg_time or None,
+                "total_suggestions": total_suggestions or 0,
+                "total_tokens_used": total_tokens or 0
             }
-        
+            
     except Exception as e:
-        logger.error("Failed to fetch system health", error=str(e))
-        raise HTTPException(status_code=500, detail="Failed to retrieve system health")
+        logger.error("Error fetching stats", error=str(e))
+        # Return empty stats instead of failing
+        return {
+            "period_days": days,
+            "total_reviews": 0,
+            "pending_reviews": 0,
+            "processing_reviews": 0,
+            "completed_reviews": 0,
+            "failed_reviews": 0,
+            "average_score": None,
+            "average_processing_time_ms": None,
+            "total_suggestions": 0,
+            "total_tokens_used": 0
+        }
 

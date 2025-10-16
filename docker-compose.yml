@@ -156,6 +156,7 @@ services:
     environment:
       # Service Communication
       AI_REVIEW_SERVICE_URL: http://ai-review:8000
+      METRICS_SERVICE_URL: http://metrics:8000 
       
       # Kafka - Internal communication
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
