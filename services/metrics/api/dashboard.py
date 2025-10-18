@@ -1,22 +1,66 @@
-
-# =====================================================
-# services/metrics/api/dashboard.py
-# =====================================================
+"""
+Dashboard API endpoints for metrics service - FIXED VERSION
+Handles graceful degradation when database is unavailable
+"""
 
 from fastapi import APIRouter, Query
 from datetime import datetime, timedelta
 import structlog
 
-from core.database import db_pool
+from core.database import get_db_pool, is_db_available
 
 router = APIRouter()
 logger = structlog.get_logger(__name__)
 
 
-@router.get("/reviews/stats")
+@router.get("/stats")
 async def get_review_stats(days: int = Query(7, ge=1, le=90)):
-    """Get review statistics for dashboard"""
+    """
+    Get review statistics for dashboard
+    
+    Args:
+        days: Number of days to analyze (1-90)
+    
+    Returns:
+        Review counts, scores, and processing metrics
+    """
     try:
+        logger.info("Fetching review stats", days=days)
+        
+        # Check if database is available
+        if not is_db_available():
+            logger.warning("Database not available - returning empty stats")
+            return {
+                "period_days": days,
+                "total_reviews": 0,
+                "pending_reviews": 0,
+                "processing_reviews": 0,
+                "completed_reviews": 0,
+                "failed_reviews": 0,
+                "average_score": None,
+                "average_processing_time_ms": None,
+                "total_suggestions": 0,
+                "total_tokens_used": 0,
+                "warning": "Database not available"
+            }
+        
+        db_pool = await get_db_pool()
+        if not db_pool:
+            logger.warning("Database pool is None - returning empty stats")
+            return {
+                "period_days": days,
+                "total_reviews": 0,
+                "pending_reviews": 0,
+                "processing_reviews": 0,
+                "completed_reviews": 0,
+                "failed_reviews": 0,
+                "average_score": None,
+                "average_processing_time_ms": None,
+                "total_suggestions": 0,
+                "total_tokens_used": 0,
+                "warning": "Database not available"
+            }
+        
         since_date = datetime.utcnow() - timedelta(days=days)
         
         async with db_pool.acquire() as conn:
@@ -26,7 +70,7 @@ async def get_review_stats(days: int = Query(7, ge=1, le=90)):
                 since_date
             )
             
-            # Status breakdown
+            # Status counts
             status_counts = await conn.fetch("""
                 SELECT status, COUNT(*) as count
                 FROM review_results
@@ -82,8 +126,7 @@ async def get_review_stats(days: int = Query(7, ge=1, le=90)):
             }
             
     except Exception as e:
-        logger.error("Error fetching stats", error=str(e))
-        # Return empty stats instead of failing
+        logger.error("Error fetching stats", error=str(e), exc_info=True)
         return {
             "period_days": days,
             "total_reviews": 0,
@@ -94,6 +137,6 @@ async def get_review_stats(days: int = Query(7, ge=1, le=90)):
             "average_score": None,
             "average_processing_time_ms": None,
             "total_suggestions": 0,
-            "total_tokens_used": 0
+            "total_tokens_used": 0,
+            "error": str(e)
         }
-

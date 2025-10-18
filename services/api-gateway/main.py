@@ -2,6 +2,7 @@
 API Gateway - Main FastAPI application - COMPLETE FIXED VERSION
 Handles file uploads, review results, WebSocket, and dashboard APIs
 Includes Kafka consumer integration for async processing
+FIXED: Analytics endpoints now properly aligned
 """
 
 from fastapi import FastAPI, Request
@@ -15,7 +16,7 @@ import asyncio
 
 from core.config import settings
 from core.exceptions import ValidationError, ProcessingError
-from api import upload, reviews, websocket
+from api import upload, reviews, websocket, analytics
 from services.kafka_producer import initialize_kafka_producer, shutdown_kafka_producer
 from services.kafka_consumer import start_kafka_consumer, stop_kafka_consumer
 
@@ -341,6 +342,10 @@ async def root():
             "reviews": "/api/reviews",
             "reviews_stats": "/api/reviews/stats",
             "websocket": "/api/reviews/ws/reviews",
+            "analytics_stats": "/api/analytics/stats",
+            "analytics_issues": "/api/analytics/issues",
+            "analytics_performance": "/api/analytics/performance",
+            "analytics_quality": "/api/analytics/quality",
             "docs": "/docs" if settings.ENVIRONMENT == "development" else None,
         },
         "kafka": {
@@ -370,6 +375,12 @@ app.include_router(
     websocket.router,
     prefix="/api/reviews",
     tags=["WebSocket"]
+)
+
+app.include_router(
+    analytics.router,
+    prefix="/api/analytics",
+    tags=["Analytics"]
 )
 
 
@@ -445,6 +456,12 @@ async def not_found_handler(request: Request, exc):
                 "upload": "/api/upload",
                 "reviews": "/api/reviews",
                 "websocket": "/api/reviews/ws/reviews",
+                "analytics": {
+                    "stats": "/api/analytics/stats",
+                    "issues": "/api/analytics/issues",
+                    "performance": "/api/analytics/performance",
+                    "quality": "/api/analytics/quality",
+                }
             }
         }
     )
